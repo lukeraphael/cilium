@@ -126,34 +126,7 @@ func (ops *ops) setupFQOnLink(link netlink.Link, q *tables.BandwidthQDisc) error
 	if err != nil {
 		return fmt.Errorf("QdiscList: %w", err)
 	}
-	updatedQdiscs := 0
-	// Update numEgressQdiscs to only include egress qdiscs while iterating
-	numEgressQdiscs := len(qdiscs)
-	for _, qdisc := range qdiscs {
-		switch qdisc.Attrs().Parent {
-		// Update egress qdisc count by excluding clsact and ingress qdiscs.
-		// clsact and ingress have the same handle.
-		case netlink.HANDLE_CLSACT:
-			numEgressQdiscs--
-		case netlink.HANDLE_ROOT:
-			if qdisc.Type() == "mq" {
-				updatedQdiscs++
-			}
-		default:
-			if qdisc.Type() == "fq" {
-				fq, _ := qdisc.(*netlink.Fq)
-
-				// If it's "fq" and with our parameters, then assume this was
-				// already set up and there wasn't any MQ support.
-				ok := fq.Horizon == uint32(q.FqHorizon.Microseconds()) &&
-					fq.Buckets == q.FqBuckets
-				if ok {
-					updatedQdiscs++
-				}
-			}
-		}
-	}
-	if updatedQdiscs == numEgressQdiscs {
+	if fqIsSetUp(qdiscs, q) {
 		return nil
 	}
 
@@ -216,6 +189,42 @@ func (ops *ops) setupFQOnLink(link netlink.Link, q *tables.BandwidthQDisc) error
 	}
 
 	return nil
+}
+
+// fqIsSetUp returns true if the egress qdiscs of a device are already set up
+// with the parameters of q: either "mq" with "fq" leaves, or a root "fq" on
+// a device without MQ support.
+func fqIsSetUp(qdiscs []netlink.Qdisc, q *tables.BandwidthQDisc) bool {
+	updatedQdiscs := 0
+	// Update numEgressQdiscs to only include egress qdiscs while iterating
+	numEgressQdiscs := len(qdiscs)
+	for _, qdisc := range qdiscs {
+		switch qdisc.Attrs().Parent {
+		// Update egress qdisc count by excluding clsact and ingress qdiscs.
+		// clsact and ingress have the same handle.
+		case netlink.HANDLE_CLSACT:
+			numEgressQdiscs--
+		case netlink.HANDLE_ROOT:
+			// If the root is "fq" with our parameters, then assume this was
+			// already set up and there wasn't any MQ support.
+			if qdisc.Type() == "mq" || isFqWithParams(qdisc, q) {
+				updatedQdiscs++
+			}
+		default:
+			if isFqWithParams(qdisc, q) {
+				updatedQdiscs++
+			}
+		}
+	}
+	return updatedQdiscs == numEgressQdiscs
+}
+
+// isFqWithParams returns true if qdisc is "fq" with the parameters of q.
+func isFqWithParams(qdisc netlink.Qdisc, q *tables.BandwidthQDisc) bool {
+	fq, ok := qdisc.(*netlink.Fq)
+	return ok &&
+		fq.Horizon == uint32(q.FqHorizon.Microseconds()) &&
+		fq.Buckets == q.FqBuckets
 }
 
 var _ reconciler.Operations[*tables.BandwidthQDisc] = &ops{}

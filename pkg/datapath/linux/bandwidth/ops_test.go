@@ -110,6 +110,15 @@ func TestPrivilegedOps(t *testing.T) {
 	})
 	require.NoError(t, err, "expected no error from second update")
 
+	// The qdiscs must not have been replaced, as that would have dropped
+	// their queued packets.
+	qdiscsAfter, err := safenetlink.WithRetryResult(func() ([]netlink.Qdisc, error) {
+		//nolint:forbidigo
+		return nlh.QdiscList(link)
+	})
+	require.NoError(t, err, "QdiscList")
+	require.Equal(t, qdiscHandles(qdiscs), qdiscHandles(qdiscsAfter), "qdiscs replaced by second update")
+
 	// Non-existing devices return an error.
 	err = ns.Do(func() error {
 		return ops.Update(ctx, nil, 0, &tables.BandwidthQDisc{
@@ -121,6 +130,96 @@ func TestPrivilegedOps(t *testing.T) {
 		})
 	})
 	require.Error(t, err, "expected no error from update of non-existing device")
+}
+
+func qdiscHandles(qdiscs []netlink.Qdisc) []uint32 {
+	handles := make([]uint32, 0, len(qdiscs))
+	for _, qdisc := range qdiscs {
+		handles = append(handles, qdisc.Attrs().Handle)
+	}
+	return handles
+}
+
+func TestFqIsSetUp(t *testing.T) {
+	q := &tables.BandwidthQDisc{
+		FqHorizon: FqDefaultHorizon,
+		FqBuckets: FqDefaultBuckets,
+	}
+	fq := func(parent uint32, buckets uint32) netlink.Qdisc {
+		return &netlink.Fq{
+			QdiscAttrs: netlink.QdiscAttrs{Parent: parent},
+			Horizon:    uint32(FqDefaultHorizon.Microseconds()),
+			Buckets:    buckets,
+		}
+	}
+	generic := func(parent uint32, qdiscType string) netlink.Qdisc {
+		return &netlink.GenericQdisc{
+			QdiscAttrs: netlink.QdiscAttrs{Parent: parent},
+			QdiscType:  qdiscType,
+		}
+	}
+	mqLeaf := func(i uint16) uint32 { return netlink.MakeHandle(0x8001, i) }
+
+	testCases := []struct {
+		name   string
+		qdiscs []netlink.Qdisc
+		want   bool
+	}{
+		{
+			name: "mq with fq leaves",
+			qdiscs: []netlink.Qdisc{
+				generic(netlink.HANDLE_ROOT, "mq"),
+				fq(mqLeaf(1), FqDefaultBuckets),
+				fq(mqLeaf(2), FqDefaultBuckets),
+				generic(netlink.HANDLE_CLSACT, "clsact"),
+			},
+			want: true,
+		},
+		{
+			name: "mq with a non-fq leaf",
+			qdiscs: []netlink.Qdisc{
+				generic(netlink.HANDLE_ROOT, "mq"),
+				fq(mqLeaf(1), FqDefaultBuckets),
+				generic(mqLeaf(2), "pfifo_fast"),
+			},
+			want: false,
+		},
+		{
+			name: "mq with an fq leaf with other parameters",
+			qdiscs: []netlink.Qdisc{
+				generic(netlink.HANDLE_ROOT, "mq"),
+				fq(mqLeaf(1), 10),
+			},
+			want: false,
+		},
+		{
+			name: "root fq without MQ support",
+			qdiscs: []netlink.Qdisc{
+				fq(netlink.HANDLE_ROOT, FqDefaultBuckets),
+				generic(netlink.HANDLE_CLSACT, "clsact"),
+			},
+			want: true,
+		},
+		{
+			name: "root fq with other parameters",
+			qdiscs: []netlink.Qdisc{
+				fq(netlink.HANDLE_ROOT, 10),
+			},
+			want: false,
+		},
+		{
+			name: "root noqueue",
+			qdiscs: []netlink.Qdisc{
+				generic(netlink.HANDLE_ROOT, "noqueue"),
+			},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, fqIsSetUp(tc.qdiscs, q))
+		})
+	}
 }
 
 func TestPrivilegedOpsBond(t *testing.T) {
